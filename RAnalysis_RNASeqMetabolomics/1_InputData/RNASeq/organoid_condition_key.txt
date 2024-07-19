@@ -1,0 +1,10 @@
+	condition
+M1.1	Media1
+M1.2	Media1
+M1.3	Media1
+M2.1	Media2
+M2.2	Media2
+M2.3	Media2
+M3.1	Media3
+M3.2	Media3
+M3.3	Media3

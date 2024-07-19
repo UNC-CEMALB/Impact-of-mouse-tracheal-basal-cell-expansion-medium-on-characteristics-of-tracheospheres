@@ -1,0 +1,1197 @@
+---
+title: "Corteselli et al Organoid RNASeq and Metabolomics Analysis"
+author: "Elizabeth Corteselli & Elise Hickman"
+date: "2023-06-03"
+output: 
+  html_document:
+    code_folding: show
+    toc: true
+    toc_depth: 6
+    number_sections: false
+---
+
+# Set up workspace
+
+```{r message = FALSE, warning = FALSE}
+# Clear global environment
+rm(list=ls())
+
+# Load packages
+library(tidyverse) # for data organization and manipulation
+library(janitor) # for data cleaning
+library(RUVSeq) # for exploring data normalization
+library(DESeq2) # for differential gene expression
+library(pheatmap) # for creating heatmaps
+library(readxl) # for reading in Excel files
+library(openxlsx) # newer better package for reading in Excel files
+library(purrr) # for data manipulation
+library(ggprism) # for graphing
+library(factoextra) # for PCA
+library(rstatix) # for stats analysis
+library(DT) # for displaying tables
+
+# Set graphing theme
+theme_set(theme_bw())
+
+# Define masked functions
+select <- dplyr::select
+rename <- dplyr::rename
+```
+
+# RNASeq Analysis
+
+## Import and clean RNASeq count data
+
+These initial cleaning steps 1) remove genes with 0 counts in all samples, 2) add together the counts from the two lanes that each sample was run on, and 3) remove extraneous text from the gene names.
+```{r}
+# Import data
+count_data_raw <- read.csv("1_InputData/RNASeq/RNASeq_CountData_Raw.csv", header = TRUE, row.names = (1))
+
+# Clean data
+count_data_cleaned <- count_data_raw %>%
+  
+  # Remove rows with all zeroes
+  filter(if_all(everything(.), ~. != 0)) %>%
+  
+  # Add together lanes
+  t() %>% as.data.frame() %>%
+  rownames_to_column("sample_id") %>%
+  separate(sample_id, into = c("condition", "exp_rep", "lane")) %>%
+  unite(sample_id, condition, exp_rep, sep = "_") %>%
+  group_by(sample_id) %>%
+  summarise(across(where(is.integer), ~ sum(.x))) %>%
+  column_to_rownames("sample_id") %>%
+  t() %>% as.data.frame() %>%
+  
+  # Remove everything after the period in the gene names
+  rownames_to_column("gene") %>%
+  separate(gene, into = c("gene", NA), sep = "[.]")
+```
+
+Next, ESNG names were converted to standard gene names.
+```{r}
+# Import gene names
+gene_info_df <- as.data.frame(read.csv("1_InputData/RNASeq/gProfiler_mmusculus_gene_names.csv", header = TRUE, row.names = 1)) %>%
+  rownames_to_column("gene")
+
+# Add gene names to count data frame and remove ENSG names
+count_data_cleaned <- count_data_cleaned %>%
+  left_join(gene_info_df %>% select(c(gene, name)), by = "gene") %>%
+  select(-gene) %>%
+  rename("gene" = "name")
+```
+
+Duplicated genes were renamed such that the first instance of the gene was called "gene_1" and the second instance was called "gene_2." There were only four genes with duplicated rows. If any of these genes appear in the final significant gene lists, the underscores will need to be removed so that the genes can be correctly identified by IPA.
+```{r}
+# Give duplicated gene names unique names by adding an underscore 
+
+## Function for making unique names
+make.unique.2 = function(x, sep){
+    ave(x, x, FUN = function(a){if(length(a) > 1){paste(a, 1:length(a), sep = sep)} else {a}})
+}
+
+## How many genes are duplicated and which genes are they?
+count_data_dups_df <- count_data_cleaned %>%
+  group_by(gene) %>%
+  filter(n()>1) 
+
+## Apply function to make unique names and move those names to the row names
+count_data_cleaned <- count_data_cleaned %>%
+  mutate(gene = make.unique.2(gene, sep = "_")) %>%
+  column_to_rownames("gene")
+```
+
+Last, rename columns so that they match with actual experimental group names (M for media)
+```{r}
+# Additional cleaning steps - remove condition 1, rename columns to match conditions
+count_data_cleaned <- count_data_cleaned %>%
+  select(-contains("X1")) %>%
+  rename("M1.1" = "X2_1", 
+         "M1.2" = "X2_2", 
+         "M1.3" = "X2_3",
+         "M2.1" = "X3_1",
+         "M2.2" = "X3_2",
+         "M2.3" = "X3_3",
+         "M3.1" = "X4_1",
+         "M3.2" = "X4_2",
+         "M3.3" = "X4_3")
+```
+
+## Import metadata
+
+```{r}
+# Read in metadata and order the conditions
+metadata <- read.table("1_InputData/RNASeq/organoid_condition_key.txt", header = TRUE) %>%
+  mutate(condition = dplyr::recode(condition, "Media1" = "Medium1", "Media2" = "Medium2", "Media3" = "Medium3")) %>%
+  mutate(condition = factor(condition, levels = c("Medium1", "Medium2", "Medium3")))
+```
+
+## DESeq analysis
+
+The following code uses the package DESeq to determine genes with significant differential expression. We also explored adding in an experimental design term for unwanted experimental variation due to cell/tissue/technical heterogeneity (RUVg); however, differentially expressed genes with the two approaches were almost identical, and the project's hypothesis/findings relate to cell type heterogeneity. Therefore, the version of the analysis selected for final export and graphing is with only condition included in the design equation.
+
+### Remove Unwanted Variation (RUV) exploration
+
+The first step in the RUV workflow is creating the relative log expression (RLE) plot, which shows boxplots of the log-ratios of read counts of each sample to those of a reference sample (the median across all the samples). Ideally, distributions should be centered around the zero line and as tight as possible. 
+
+```{r}
+# Transpose data frame and add in treatment condition
+count_data_t <- count_data_cleaned %>% 
+  t() %>% as.data.frame() %>%
+  rownames_to_column("sample")
+
+count_data_t <- metadata %>% 
+  rownames_to_column("sample") %>%
+  left_join(count_data_t, by = "sample")
+
+# Store IDs as a separate vector
+ID <- count_data_t$sample
+
+# Store conditions as a separate vector
+groups <- as.factor(count_data_t$condition)
+
+# Set control label
+ctrl <- "Medium1"
+
+# Extract vector of other groups
+other_groups <- setdiff(groups, ctrl)
+
+# Create SeqExpressionSet
+exprSet <- newSeqExpressionSet(as.matrix(count_data_cleaned),phenoData = 
+                                 data.frame(groups,row.names=colnames(count_data_cleaned)))
+
+# Show groups whose distributions vary from the overall
+colors <- c("steelblue2", "gold1", "darkorange1")
+plotRLE(exprSet, outline=FALSE, col = colors[groups])
+```
+
+We can also visualize the data using a PCA plot to see if samples group as expected.
+```{r}
+# Plot PCA
+plotPCA(exprSet, col=colors[groups], cex=1.2)
+```
+
+The following code removes unwanted variation using the RUVg approach and generates the same visualizations as above with the adjusted data. We can see that data are more centered around zero now, but the spread is not similar across groups any more.
+```{r}
+# Construct a matrix specifying the replicates (samples of the same condition)
+differences <- makeGroups(groups)
+
+# Capture 1 factor of unwanted variation (k = 1)
+ruv_set <- RUVs(exprSet, rownames(count_data_cleaned), k=1, differences) 
+
+# View updated distributions per sample
+plotRLE(ruv_set, outline=FALSE, col = colors[groups])
+```
+
+We can also see much clearer groupings with PCA. In downstream analysis with DESeq, we'll explore whether including the unwanted variation term has a significant impact on our analysis.
+
+```{r}
+# PCA
+plotPCA(ruv_set, col=colors[groups], cex=1.2)
+```
+
+### Run DESeq
+
+#### With ~ condition 
+
+Create data matrix, DESeqDataSet object, and run DESeq function.
+```{r message = FALSE}
+# Make data matrix for input
+count_data_dm <- as.matrix(count_data_cleaned)
+
+# Create DESeqDataSet object
+org_deseq_input <- DESeqDataSetFromMatrix(countData = count_data_dm, colData = metadata, design = ~condition)
+
+# Run DESeq
+org_deseq <- DESeq(org_deseq_input)
+```
+
+Extract results and filter them for our cutoff of p-adjust less than 0.05 and absolute value of the log2FoldChange greater than 1.5.
+```{r}
+# Extract results
+deseq_res_1vs2 <- as.data.frame(results(org_deseq, contrast = (c("condition", "Medium2", "Medium1"))))
+deseq_res_1vs3 <- as.data.frame(results(org_deseq, contrast = (c("condition", "Medium3", "Medium1"))))
+deseq_res_2vs3 <- as.data.frame(results(org_deseq, contrast = (c("condition", "Medium3", "Medium2"))))
+
+# Filter
+deseq_res_1vs2_filtered <- deseq_res_1vs2 %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+
+deseq_res_1vs3_filtered <- deseq_res_1vs3 %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+
+deseq_res_2vs3_filtered <- deseq_res_2vs3 %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+```
+
+#### With ~ condition + W_1 (unwanted variation)
+
+This workflow is identical to the above section, except the DESeqDataSet is created using the ruv_set object. It is important to note that counts(ruv_set) is just the original count matrix, and the unwanted variation is taken into account in the pData(ruv_set), which has an additional column W_1 that is included in the design formula.
+
+```{r message = FALSE}
+# Create DESeqDataSet object
+org_deseq_input_ruv <- DESeqDataSetFromMatrix(countData = counts(ruv_set), colData = pData(ruv_set), design = ~ groups + W_1)
+
+# Run DESeq
+org_deseq_ruv <- DESeq(org_deseq_input_ruv)
+
+# Extract results
+deseq_res_1vs2_ruv <- as.data.frame(results(org_deseq_ruv, contrast = (c("groups", "Medium2", "Medium1"))))
+deseq_res_1vs3_ruv <- as.data.frame(results(org_deseq_ruv, contrast = (c("groups", "Medium3", "Medium1"))))
+deseq_res_2vs3_ruv <- as.data.frame(results(org_deseq_ruv, contrast = (c("groups", "Medium3", "Medium2"))))
+
+# Filter
+deseq_res_1vs2_ruv_filtered <- deseq_res_1vs2_ruv %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+
+deseq_res_1vs3_ruv_filtered <- deseq_res_1vs3_ruv %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+
+deseq_res_2vs3_ruv_filtered <- deseq_res_2vs3_ruv %>%
+  filter(padj < 0.05 & abs(log2FoldChange) > 1.5)
+```
+
+### Compare results and export gene lists
+
+How many genes are different between the two DESeq approaches?
+```{r}
+# Determine how many genes are similar between the gene sets from the two approaches
+compare_1vs2_similar <- intersect(rownames(deseq_res_1vs2_ruv_filtered), rownames(deseq_res_1vs2_filtered))
+compare_1vs3_similar <- intersect(rownames(deseq_res_1vs3_ruv_filtered), rownames(deseq_res_1vs3_filtered))
+compare_2vs3_similar <- intersect(rownames(deseq_res_2vs3_ruv_filtered), rownames(deseq_res_2vs3_filtered))
+
+# Make data frame summarizing similarities/overlap
+deseq_approaches_compare <- data.frame(comparison = c("1vs2", "1vs3", "2vs3"), 
+                                       n_genes_orig = c(nrow(deseq_res_1vs2_filtered), 
+                                                        nrow(deseq_res_1vs3_filtered), 
+                                                        nrow(deseq_res_2vs3_filtered)),
+                                       n_genes_ruv = c(nrow(deseq_res_1vs2_ruv_filtered),
+                                                       nrow(deseq_res_1vs3_ruv_filtered),
+                                                       nrow(deseq_res_2vs3_ruv_filtered)),
+                                       n_genes_overlap = c(length(compare_1vs2_similar),
+                                                           length(compare_1vs3_similar),
+                                                           length(compare_2vs3_similar))) %>%
+  mutate(perc_overlap_orig = n_genes_overlap/n_genes_orig*100) %>%
+  mutate(perc_overlap_ruv = n_genes_overlap/n_genes_ruv*100)
+
+# View summary data frame
+deseq_approaches_compare
+```
+
+Because there is a high percentage of overlap between the two approaches, particularly for the comparisons of primary interest (1vs2 and 1vs3), we will keep the original approach for files to export to IPA.  
+```{r}
+# Write output files
+write.csv(deseq_res_1vs2_filtered, file = "2_OutputTables/organoid_DESeq_res_1vs2_p0.05_l2FCof1.5.csv")
+write.csv(deseq_res_1vs3_filtered, file = "2_OutputTables/organoid_DESeq_res_1vs3_p0.05_l2FCof1.5.csv")
+write.csv(deseq_res_2vs3_filtered, file = "2_OutputTables/organoid_DESeq_res_2vs3_p0.05_l2FCof1.5.csv")
+```
+
+
+## Visualization for RNASeq Data
+
+### PCA Plot
+
+```{r}
+# Extract normalized count data
+count_data_norm <- as.data.frame(counts(org_deseq, normalized = TRUE))
+
+# Run PCA
+pca_res_counts_norm <- prcomp(t(count_data_norm %>% as.matrix))
+
+# PCA plot
+pca_plot_counts_norm <- fviz_pca_ind(pca_res_counts_norm, 
+             label = "none",
+             pointsize = 5,
+             habillage = metadata$condition,
+             palette = c("steelblue2", "gold1", "darkorange1"),
+             mean.point = FALSE,
+             title = "Principal Component Analysis") +
+  theme(axis.title = element_text(size = 16),
+        axis.title.x = element_text(margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 0)),
+        axis.title.y = element_text(margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)),
+      panel.border = element_rect(fill = NA, color = "black", linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(), 
+      plot.title = element_text(hjust = 0.5, size = 22, face = "bold"),
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      axis.text = element_text(size = 12))
+
+# Write out plot
+png(file = "3_OutputFigs/PCAPlot_NormCounts_ForPub.png",
+    width = 6, height = 4.5, units = "in", res = 1200)
+pca_plot_counts_norm
+invisible(dev.off())
+
+pca_plot_counts_norm
+```
+
+### Heatmaps
+
+#### All genes
+
+```{r}
+# Make vector of significant genes to keep
+keep_genes <- unique(c(rownames(deseq_res_1vs2_filtered), 
+                       rownames(deseq_res_1vs3_filtered), 
+                       rownames(deseq_res_2vs3_filtered)))
+
+# Filter and make data matrix for pheatmap
+count_data_for_heatmap <- count_data_norm %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% keep_genes) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Define annotation colors and names
+heatmap_color = list(Condition = c(Medium1 = "steelblue2", Medium2 = "gold1", Medium3 = "darkorange1"))
+metadata_heatmap <- rename(metadata, "Condition" = "condition")
+
+# Make heat map
+seq_heatmap_all <- pheatmap(count_data_for_heatmap,
+         scale = 'row', 
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         annotation_col = metadata_heatmap, 
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE, 
+         border_color = "black",
+         show_rownames = F, 
+         show_colnames = T,
+         angle_col = c("0"),
+         treeheight_row = 0,
+         treeheight_col = 20)
+
+png(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_AllGenes.png",
+    width = 7, height = 7, units = "in", res = 1200)
+seq_heatmap_all
+invisible(dev.off())
+
+seq_heatmap_all
+```
+
+
+#### By top 15 genes for each pairwise comparison
+
+```{r message = FALSE}
+# Extract genes with lowest p-adjusted value from each of the sets of pairwise results
+deseq_res_1vs2_topgenes_df <- deseq_res_1vs2_filtered %>%
+  slice_min(padj, n = 15)
+
+deseq_res_1vs3_topgenes_df <- deseq_res_1vs3_filtered %>%
+  slice_min(padj, n = 15)
+
+deseq_res_2vs3_topgenes_df <- deseq_res_2vs3_filtered %>%
+  slice_min(padj, n = 15)
+
+# Make a vector of gene names to keep for the heatmap
+keep_genes <- unique(c(rownames(deseq_res_1vs2_topgenes_df), rownames(deseq_res_1vs3_topgenes_df), rownames(deseq_res_2vs3_topgenes_df)))
+
+# Function to make row or column names bold
+# parameters:
+#   mat: the matrix passed to pheatmap
+#   rc_fun: either rownames or colnames
+#   rc_names: vector of names that should appear in boldface
+make_italic_names <- function(mat, rc_fun, rc_names) {
+  italic_names <- rc_fun(mat)
+  ids <- rc_names %>% match(rc_fun(mat))
+  ids %>%
+    walk(
+      function(i)
+        italic_names[i] <<-
+        bquote(italic(.(rc_fun(mat)[i]))) %>%
+        as.expression()
+    )
+  italic_names
+}
+
+# Filter data to genes of interest
+count_data_for_heatmap <- count_data_norm %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% keep_genes) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Define annotation colors and names
+heatmap_color = list(Condition = c(Medium1 = "steelblue2", Medium2 = "gold1", Medium3 = "darkorange1"))
+metadata_heatmap <- rename(metadata, "Condition" = "condition")
+
+# Define row names
+rownames_vec <- rownames(count_data_for_heatmap)
+
+# Make heat map
+seq_heatmap <- pheatmap(count_data_for_heatmap,
+         scale = 'row', 
+         cellwidth = 25, 
+         cellheight = 12,
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         treeheight_row = 10, treeheight_col = 10,
+         annotation_col = metadata_heatmap, 
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE, 
+         border_color = "black", 
+         show_rownames = T, 
+         show_colnames = F,
+         fontsize = 10, 
+         cutree_rows = 5,
+         angle_col = c("0"),
+         labels_row = make_italic_names(count_data_for_heatmap, rownames, rownames_vec))
+
+pdf(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_Top15.pdf",
+    width = 7, height = 7)
+seq_heatmap
+invisible(dev.off())
+
+seq_heatmap
+
+png(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_Top15.png",
+    width = 7, height = 7, units = "in", res = 1200)
+seq_heatmap
+invisible(dev.off())
+
+seq_heatmap
+```
+
+#### With genes associated with IPF (manual curation)
+
+Import manually curated gene list:
+```{r}
+# Import data and pull gene list into vector
+ipf_genes <- read.xlsx("1_InputData/RNASeq/IPF ABC genes.xlsx") %>%
+  pull("GENE")
+
+# Filter raw count data for only genes in the IPF gene list
+raw_count_data_ipf <- count_data_cleaned %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes)
+```
+
+Filter DESeq2 results for only manually curated IPF genes:
+```{r}
+# Filter results
+deseq_res_1vs2_ipf <- deseq_res_1vs2 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_1vs2" = "padj", "log2FoldChange_1vs2" = "log2FoldChange") %>%
+  mutate(sig_1vs2 = ifelse(padj_1vs2 < 0.05, "Yes", "No"))
+
+deseq_res_1vs3_ipf <- deseq_res_1vs3 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_1vs3" = "padj", "log2FoldChange_1vs3" = "log2FoldChange") %>%
+  mutate(sig_1vs3 = ifelse(padj_1vs3 < 0.05, "Yes", "No"))
+
+deseq_res_2vs3_ipf <- deseq_res_2vs3 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_2vs3" = "padj", "log2FoldChange_2vs3" = "log2FoldChange") %>%
+  mutate(sig_2vs3 = ifelse(padj_2vs3 < 0.05, "Yes", "No"))
+
+# Join all of the data together
+ipf_deseq_res <- list(deseq_res_1vs2_ipf, deseq_res_1vs3_ipf, deseq_res_2vs3_ipf) %>%
+  purrr::reduce(full_join, by = "Gene")
+
+ipf_deseq_res_with_counts <- raw_count_data_ipf %>%
+  left_join(ipf_deseq_res, by = "Gene") %>%
+  mutate(Gene = str_to_title(Gene))
+
+# Export data for supplement
+write.xlsx(ipf_deseq_res_with_counts, "2_OutputTables/IPFGene_Results.xlsx")
+```
+
+Make heatmap with DESeq Norm Genes:
+```{r}
+# Determine which genes will be kept from the IPF list (needs to be significant for at least one comparison)
+ipf_genes_for_heatmap <- ipf_deseq_res %>%
+  filter(sig_1vs2 == "Yes" | sig_1vs3 == "Yes" | sig_2vs3 == "Yes") %>%
+  mutate(Gene = str_to_title(Gene)) %>%
+  pull("Gene")
+
+# Filter data to genes of interest
+count_data_for_heatmap_ipf <- count_data_norm %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% ipf_genes_for_heatmap) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Define annotation colors and names
+heatmap_color = list(Condition = c(Medium1 = "steelblue2", Medium2 = "gold1", Medium3 = "darkorange1"))
+metadata_heatmap <- rename(metadata, "Condition" = "condition")
+
+# Define row names
+rownames_vec <- rownames(count_data_for_heatmap_ipf)
+
+# Make heat map
+seq_heatmap_ipf <- pheatmap(count_data_for_heatmap_ipf,
+         scale = 'row', 
+         cellwidth = 25, 
+         cellheight = 12,
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         treeheight_row = 10, treeheight_col = 10,
+         annotation_col = metadata_heatmap, 
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE, 
+         border_color = "black", 
+         show_rownames = T, 
+         cutree_rows = 4,
+         show_colnames = F,
+         fontsize = 10, 
+         angle_col = c("0"),
+         labels_row = make_italic_names(count_data_for_heatmap_ipf, rownames, rownames_vec))
+
+pdf(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_IPFGenes.pdf",
+    width = 7, height = 7)
+seq_heatmap_ipf
+invisible(dev.off())
+
+png(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_IPFGenes.png",
+    width = 7, height = 7, units = "in", res = 1200)
+seq_heatmap_ipf
+invisible(dev.off())
+
+seq_heatmap_ipf
+```
+
+#### With genes associated with IPF (IPA Analysis)
+
+Import manually curated gene list:
+```{r}
+# Import data and pull gene list into vector
+ipf_genes_ipa <- read.xlsx("1_InputData/RNASeq/IPF IPA genes.xlsx") %>%
+  pull("genes")
+
+# Filter raw count data for only genes in the IPF gene list
+raw_count_data_ipf_ipa <- count_data_cleaned %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes_ipa)
+```
+
+Filter DESeq2 results for only manually curated IPF genes:
+```{r}
+# Filter results
+deseq_res_1vs2_ipf_ipa <- deseq_res_1vs2 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes_ipa) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_1vs2" = "padj", "log2FoldChange_1vs2" = "log2FoldChange") %>%
+  mutate(sig_1vs2 = ifelse(padj_1vs2 < 0.05, "Yes", "No"))
+
+deseq_res_1vs3_ipf_ipa <- deseq_res_1vs3 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes_ipa) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_1vs3" = "padj", "log2FoldChange_1vs3" = "log2FoldChange") %>%
+  mutate(sig_1vs3 = ifelse(padj_1vs3 < 0.05, "Yes", "No"))
+
+deseq_res_2vs3_ipf_ipa <- deseq_res_2vs3 %>%
+  rownames_to_column("Gene") %>%
+  mutate(Gene = toupper(Gene)) %>%
+  filter(Gene %in% ipf_genes_ipa) %>%
+  select(c(Gene, log2FoldChange, padj)) %>%
+  rename("padj_2vs3" = "padj", "log2FoldChange_2vs3" = "log2FoldChange") %>%
+  mutate(sig_2vs3 = ifelse(padj_2vs3 < 0.05, "Yes", "No"))
+
+# Join all of the data together
+ipf_deseq_res_ipa <- list(deseq_res_1vs2_ipf_ipa, deseq_res_1vs3_ipf_ipa, deseq_res_2vs3_ipf_ipa) %>%
+  purrr::reduce(full_join, by = "Gene")
+
+ipf_deseq_res_with_counts_ipa <- raw_count_data_ipf_ipa %>%
+  left_join(ipf_deseq_res_ipa, by = "Gene") %>%
+  mutate(Gene = str_to_title(Gene))
+
+# Export data for supplement
+write.xlsx(ipf_deseq_res_with_counts_ipa, "2_OutputTables/IPFGene_Results_IPA.xlsx")
+```
+
+Make heatmap with DESeq Norm Genes:
+```{r}
+# Determine which genes will be kept from the IPF list (needs to be significant for at least one comparison)
+ipf_genes_for_heatmap_ipa <- ipf_deseq_res_ipa %>%
+  filter(sig_1vs2 == "Yes" | sig_1vs3 == "Yes" | sig_2vs3 == "Yes") %>%
+  mutate(Gene = str_to_title(Gene)) %>%
+  pull("Gene")
+
+# Filter data to genes of interest
+count_data_for_heatmap_ipf_ipa <- count_data_norm %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% ipf_genes_for_heatmap_ipa) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+# Define annotation colors and names
+heatmap_color = list(Condition = c(Medium1 = "steelblue2", Medium2 = "gold1", Medium3 = "darkorange1"))
+metadata_heatmap <- rename(metadata, "Condition" = "condition")
+
+# Define row names
+rownames_vec <- rownames(count_data_for_heatmap_ipf_ipa)
+
+# Make heat map
+seq_heatmap_ipf_ipa <- pheatmap(count_data_for_heatmap_ipf_ipa,
+         scale = 'row', 
+         cellwidth = 25, 
+         cellheight = 12,
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         treeheight_row = 10, treeheight_col = 10,
+         annotation_col = metadata_heatmap, 
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE, 
+         border_color = "black", 
+         show_rownames = T, 
+         cutree_rows = 4,
+         show_colnames = F,
+         fontsize = 10, 
+         angle_col = c("0"),
+         labels_row = make_italic_names(count_data_for_heatmap_ipf_ipa, rownames, rownames_vec))
+
+pdf(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_IPFGenes_IPA.pdf",
+    width = 7, height = 7)
+seq_heatmap_ipf_ipa
+invisible(dev.off())
+
+png(file = "3_OutputFigs/Heatmap_DESeq_DESeqNorm_IPFGenes_IPA.png",
+    width = 7, height = 7, units = "in", res = 1200)
+seq_heatmap_ipf_ipa
+invisible(dev.off())
+
+seq_heatmap_ipf_ipa
+```
+
+# Metabolomics Analysis
+
+## Import and clean data
+
+Initial import and clean.
+```{r warning = FALSE}
+# Import data and clean
+metab_data_all <- read.csv("1_InputData/Metabolomics/Metabolomics_Original_Data.csv") %>%
+  select(c(X.1, X4:X12)) %>%
+  row_to_names(1) %>%
+  remove_rownames() %>%
+  column_to_rownames("compound")
+
+# Rename col names by number from manuscript
+colnames(metab_data_all) <- c("M1.1", "M1.2", "M1.3", "M2.1", "M2.2", "M2.3", "M3.1", "M3.2", "M3.3") 
+```
+
+
+## Compare between groups
+
+### Normality assessment
+
+```{r}
+# Format dataframe
+metab_data_fornorm <- metab_data_all %>%
+  t() %>% data.frame() %>%
+  clean_names() %>%
+  mutate(across(everything(), \(x) as.numeric(x)))
+
+# Apply Shapiro Wilk test
+shapiro_res <-  apply(metab_data_fornorm, 2, shapiro.test)
+
+# Create results dataframe
+shapiro_res <- do.call(rbind.data.frame, shapiro_res)
+
+# Clean dataframe
+shapiro_res <- shapiro_res %>% 
+  
+  # Add normality conclusion
+  mutate(normal = ifelse(p.value < 0.05, F, T)) %>%
+  
+  # Remove columns that do not contain informative data
+  select(c(p.value, normal)) 
+
+# Summarize how many are normally vs. not-normally distributed
+shapiro_res %>% dplyr::count(normal)
+```
+
+Well over half of the metabolites are normally distributed, so we'll proceed with parametric statistical testing.
+
+### One-way ANOVA
+
+To prepare the data for statistical testing, we'll first format the dataframe such that the samples are in rows and the metabolites are in columns, with a column indicating what group the sample belongs to. 
+
+```{r}
+# Further prepare dataframe for statistical testing
+metab_data_forstats <- metab_data_fornorm %>%
+  rownames_to_column("Sample_ID") %>%
+  separate(Sample_ID, into = c("Condition", "Replicate"), sep = "\\.", remove = FALSE) %>%
+  mutate(Condition = dplyr::recode(Condition, "M1" = "Medium1", "M2" = "Medium2", "M3" = "Medium3"))
+```
+
+We also need to make a key for the metabolites so that we can match them up with their original names (the original names will become poorly formatted when they become column names).
+
+```{r}
+metab_key <- metab_data_all %>%
+  mutate(clean_name = rownames(.)) %>%
+  select(clean_name) %>%
+  t() %>% data.frame() %>%
+  clean_names() %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("analysis_name")
+```
+
+Now, we can run the one-way ANOVA. 
+```{r}
+# Create a vector with the names of the variables you want to run the test on
+endpoints <- colnames(metab_data_forstats %>% select(carnosine:l_aspartate))
+
+# Create data frame to store results
+condition_anova <- data.frame()
+
+# Run for loop
+for (i in 1:length(endpoints)) {
+  
+  # Assign a name to the endpoint variable.
+  endpoint <- endpoints[i]
+  
+  # Run wilcox test and store in results data frame.
+  res <- metab_data_forstats %>%
+    anova_test(formula = as.formula(paste0(endpoint, "~ Condition"))) %>%
+    data.frame() %>%
+    select(p) %>%
+    mutate(analysis_name = endpoint)
+  
+  condition_anova <- BiocGenerics::rbind(condition_anova, res)
+}
+
+# View results
+datatable(condition_anova) 
+
+# Add p-value adjustment
+condition_anova$p.adj <- p.adjust(condition_anova$p, method = "BH")
+```
+
+How many metabolites are significant by p-value?
+```{r}
+nrow(condition_anova %>% filter(p < 0.05))
+```
+
+
+How many metabolites are significant by p.adj?
+```{r}
+nrow(condition_anova %>% filter(p.adj < 0.05))
+```
+
+
+### Posthoc T-test
+
+```{r}
+# Create data frame to store results
+condition_ttest_posthoc <- data.frame()
+
+# Run for loop
+for (i in 1:length(endpoints)) {
+  
+  # Assign a name to the endpoint variable.
+  endpoint <- endpoints[i]
+  
+  # Run wilcox test and store in results data frame.
+  res <- metab_data_forstats %>%
+    pairwise_t_test(as.formula(paste0(endpoint, "~ Condition")), p.adjust.method = "BH") %>%
+    data.frame()
+  
+  condition_ttest_posthoc <- rbind(condition_ttest_posthoc, res)
+}
+
+# Rename .y. column to match metabolite key
+condition_ttest_posthoc <-condition_ttest_posthoc %>% rename("analysis_name" = ".y.")
+
+# View results
+datatable(condition_ttest_posthoc)
+```
+
+How many of the metabolites had significant pairwise t-test p-values?
+```{r}
+nrow(condition_ttest_posthoc %>%
+       group_by(analysis_name) %>%
+       summarise(count_sig = sum(p.adj < 0.05)) %>%
+       filter(count_sig > 0))
+```
+
+Get names of metabolites that had at least one significant comparison.
+```{r}
+keep_metabs <- condition_ttest_posthoc %>%
+  group_by(analysis_name) %>%
+  summarise(count_sig = sum(p.adj < 0.05)) %>%
+  filter(count_sig > 0) %>%
+  left_join(metab_key, by = "analysis_name") %>%
+  pull(clean_name)
+```
+
+Calculate fold changes for each of the metabolites for each of the comparisons (for IPA input):
+```{r}
+# Group by metabolite, calculate means, transpose
+metab_data_foldchange <- metab_data_forstats %>%
+  group_by(Condition) %>%
+  summarise(across(c(carnosine:l_aspartate), \(x) mean(x))) %>%
+  column_to_rownames("Condition") %>%
+  t() %>% data.frame() %>%
+  mutate('Medium2 vs. Medium1 FC' = Medium2/Medium1) %>%
+  mutate('Medium3 vs. Medium1 FC' = Medium3/Medium1) %>%
+  mutate('Medium3 vs. Medium2 FC' = Medium3/Medium2) %>%
+  select(-c(Medium1:Medium3))
+
+# Calculate log2FC
+metab_data_foldchange_log2 <- metab_data_foldchange %>%
+  mutate(across(everything(), \(x) log2(x))) %>%
+  rename_with(.cols = all_of(colnames(metab_data_foldchange)), .fn = function(.x) {gsub("FC", "log2FC", .x)}) %>%
+  rownames_to_column("analysis_name")
+
+# Merge dataframes together
+metab_data_foldchange <- metab_data_foldchange %>%
+  rownames_to_column("analysis_name") %>%
+  left_join(metab_data_foldchange_log2, by = "analysis_name")
+```
+
+Bind KEGGID:
+```{r}
+kegg_id <- read.xlsx("1_InputData/Metabolomics/Metabolomics_KEGG_Key.xlsx") %>%
+  rename("Metabolite" = "compound", "KEGG ID" = "KEGG.ID")
+```
+
+Clean up statistical results for supplement:
+```{r}
+metab_stats_cleaned <- condition_ttest_posthoc %>%
+  unite(comparison, group2, group1, sep = " vs. ") %>%
+  select(c(analysis_name, comparison, p.adj)) %>%
+  mutate(comparison = paste(comparison, " p-value", sep = "")) %>%
+  pivot_wider(id_cols = "analysis_name", names_from = "comparison", values_from = "p.adj") %>%
+  left_join(condition_anova, by = "analysis_name") %>%
+  left_join(metab_key, by = "analysis_name") %>%
+  relocate(c("clean_name", "p", "p.adj"), .before = "Medium2 vs. Medium1 p-value") %>%
+  left_join(metab_data_foldchange, by = "analysis_name") %>%
+  select(-analysis_name) %>%
+  rename("Metabolite" = "clean_name", "Overall p-value" = "p", "Overall adjusted p-value (BH)" = "p.adj") %>%
+  arrange(`Overall p-value`) %>%
+  mutate(across('Overall p-value':'Medium3 vs. Medium2 p-value', \(x) ifelse(x < 0.0001, format(x, scientific = TRUE, digits = 3), sprintf('%.4f', x)))) %>%
+  left_join(kegg_id, by = "Metabolite") %>%
+  relocate(`KEGG ID`, .after = "Metabolite")
+  
+
+write.xlsx(metab_stats_cleaned, "2_OutputTables/Metabolite_Stats_Results_ForSupplement.xlsx")
+```
+
+
+Filter stats results for IPA input:
+```{r}
+metab_stats_cleaned_forIPA <- metab_stats_cleaned %>%
+  filter(Metabolite %in% keep_metabs)
+
+write.xlsx(metab_stats_cleaned, "2_OutputTables/Metabolite_Stats_Results_ForIPA.xlsx")
+```
+
+### Make heat map
+
+```{r}
+# Filter metabolite data to keep only metabolites with at least one significant pairwise comparison
+sig_metabolites <- condition_ttest_posthoc %>%
+  group_by(analysis_name) %>%
+  summarise(count_sig = sum(p.adj < 0.05)) %>%
+  filter(count_sig > 0) %>%
+  left_join(metab_key, by = "analysis_name") %>%
+  pull(clean_name)
+
+metab_data_filtered <- metab_data_all %>%
+  rownames_to_column("clean_name") %>%
+  filter(clean_name %in% sig_metabolites) %>%
+  column_to_rownames("clean_name") %>%
+  mutate(across(everything(), \(x) as.numeric(x)))
+
+# Define colors
+heatmap_color = list(Condition = c(Medium1 = "steelblue2", Medium2 = "gold1", Medium3 = "darkorange1"))
+
+# Make heatmap (using colors already defined above)
+metab_heatmap <- pheatmap(as.matrix(metab_data_filtered),
+         scale = 'row', 
+         cellwidth = 25, 
+         cellheight = 12,
+         color = colorRampPalette(c("navy", "white", "red"))(50),
+         treeheight_row = 20, treeheight_col = 15,
+         annotation_col = metadata %>% rename("Condition" = "condition"), 
+         annotation_colors = heatmap_color,
+         annotation_names_col = FALSE, 
+         border_color = "black", 
+         show_rownames = T, 
+         show_colnames = F,
+         fontsize = 10,
+         angle_col = c("0"))
+
+pdf(file = "3_OutputFigs/Heatmap_Metabolomics.pdf",
+    width = 10, height = 14)
+metab_heatmap
+invisible(dev.off())
+```
+
+# IPA Visualizations (Bar Charts)
+
+## Metabolomics
+
+```{r}
+# Import data
+canon_1vs2_metab <- read.xlsx("1_InputData/IPA/IPA_Metabolomics_Pathway_results_1v2_names_shortened.xlsx")
+canon_1vs3_metab <- read.xlsx("1_InputData/IPA/IPA_Metabolomics_Pathway_results_1v3_names_shortened.xlsx")
+canon_2vs3_metab <- read.xlsx("1_InputData/IPA/IPA_Metabolomics_Pathway_results_2v3_names_shortened.xlsx")
+
+# There is a duplicate pathway in canon2vs3_metab, so going to remove that. Make sure to remove or change this code if results are changed as it is referencing the row index
+canon_2vs3_metab <- canon_2vs3_metab %>%
+  filter(!row_number() %in% c(8))
+
+# Write function for graphing
+# This function takes your input data frame (data), colors for the gradient scale (high color and low color), the number of pathways you want (n), and your comparison subtitle (subtitle) as input
+# And outputs the graph of interest
+graph_top_canon_metab <- function(data, n, lowcolor, highcolor, subtitle) {
+  
+  data %>% 
+  slice_head(n = n) %>%
+  mutate(Ingenuity_canonical_pathways = make.unique(Ingenuity_canonical_pathways, sep = "_")) %>%
+  ggplot(aes(x = neg_log_p_value, y = reorder(Ingenuity_canonical_pathways, neg_log_p_value), fill = z_score)) +
+  scale_x_continuous(limits = c(0, 12), expand = c(0, 0)) +
+  scale_fill_gradient2(low = lowcolor, mid = "white", high = highcolor, midpoint = 0, guide = guide_colorbar(frame.colour = "black")) +
+  geom_bar(colour="black", stat = "identity", width = 0.6) +
+  labs(title = paste0("Canonical Pathways \n", subtitle, sep = ""), x = "-log(p-value)", fill = "Z-Score") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_text(colour = "black", size = 18),
+        axis.title.x = element_text(size = 15), 
+        axis.text.x = element_text(colour = "black", size = 15),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.key.size = unit(8, 'mm'),
+        panel.border = element_blank(),
+        legend.position = c(0.85, 0.4),
+        plot.margin = unit(c(0.25, 0.25, 0.25, 0.25), "inches")
+        ) 
+  
+}
+
+# Make plots
+plot_canon_1vs2_metab <- graph_top_canon_metab(canon_1vs2_metab, 15, "steelblue2", "gold1", "Medium 2 vs Medium 1")
+plot_canon_1vs3_metab <- graph_top_canon_metab(canon_1vs3_metab, 15, "steelblue2", "darkorange1", "Medium 3 vs Medium 1")
+plot_canon_2vs3_metab <- graph_top_canon_metab(canon_2vs3_metab, 15, "gold1", "darkorange1", "Medium 3 vs Medium 2")
+
+# View plots
+plot_canon_1vs2_metab 
+plot_canon_1vs3_metab 
+plot_canon_2vs3_metab
+```
+```{r}
+# Save plots
+ggsave("BarPlot_MetabCanonPath_1vs2.png",
+  plot = plot_canon_1vs2_metab,
+  path = "3_OutputFigs",
+  width = 11,
+  height = 6,
+  dpi = 1200)
+
+ggsave("BarPlot_MetabCanonPath_1vs3.png",
+  plot = plot_canon_1vs3_metab,
+  path = "3_OutputFigs",
+  width = 11,
+  height = 6,
+  dpi = 1200)
+
+ggsave("BarPlot_MetabCanonPath_2vs3.png",
+  plot = plot_canon_2vs3_metab,
+  path = "3_OutputFigs",
+  width = 11,
+  height = 6,
+  dpi = 1200)
+```
+
+## DESeq
+
+```{r}
+# Import data
+canon_1vs2_seq <- read.xlsx("1_InputData/IPA/Pathways 1 vs 2 DEseq titles shortened.xlsx")
+canon_1vs3_seq <- read.xlsx("1_InputData/IPA/Pathways 1 vs 3 DEseq titles shortened.xlsx")
+canon_2vs3_seq <- read.xlsx("1_InputData/IPA/Pathways 2 vs 3 DEseq titles shortened.xlsx")
+
+# Write function for graphing
+# This function takes your input data frame (data), colors for the gradient scale (high color and low color), the number of pathways you want (n), and your comparison subtitle (subtitle) as input
+# And outputs the graph of interest
+graph_top_canon_seq <- function(data, n, lowcolor, highcolor, subtitle) {
+  
+  data %>% 
+  slice_head(n = n) %>%
+  ggplot(aes(x = neg_log_p_value, y = reorder(Ingenuity_canonical_pathways, neg_log_p_value), fill = z_score)) +
+  scale_x_continuous(limits = c(0, 8), expand = c(0, 0)) +
+  scale_fill_gradient2(low = lowcolor, mid = "white", high = highcolor, midpoint = 0, guide = guide_colorbar(frame.colour = "black")) +
+  geom_bar(colour="black", stat = "identity", width = 0.6) +
+  labs(title = paste0("Canonical Pathways \n", subtitle, sep = ""), x = "-log(p-value)", fill = "Z-Score") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 20),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_text(colour = "black", size = 18),
+        axis.title.x = element_text(size = 15), 
+        axis.text.x = element_text(colour = "black", size = 15),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.key.size = unit(8, 'mm'),
+        panel.border = element_blank(),
+        legend.position = c(0.75, 0.4)
+        ) 
+  
+}
+
+# Make plots
+plot_canon_1vs2_seq <- graph_top_canon_seq(canon_1vs2_seq, 15, "steelblue2", "gold1", "Medium 2 vs Medium 1")
+plot_canon_1vs3_seq <- graph_top_canon_seq(canon_1vs3_seq, 15, "steelblue2", "darkorange1", "Medium 3 vs Medium 1")
+plot_canon_2vs3_seq <- graph_top_canon_seq(canon_2vs3_seq, 15, "gold1", "darkorange1", "Medium 3 vs Medium 2")
+
+# View plots
+plot_canon_1vs2_seq 
+plot_canon_1vs3_seq 
+plot_canon_2vs3_seq
+```
+```{r}
+# Save plots
+ggsave("BarPlot_SeqCanonPath_1vs2.png",
+  plot = plot_canon_1vs2_seq,
+  path = "3_OutputFigs",
+  width = 8,
+  height = 6,
+  dpi = 1200)
+
+ggsave("BarPlot_SeqCanonPath_1vs3.png",
+  plot = plot_canon_1vs3_seq,
+  path = "3_OutputFigs",
+  width = 8,
+  height = 6,
+  dpi = 1200)
+
+ggsave("BarPlot_SeqCanonPath_2vs3.png",
+  plot = plot_canon_2vs3_seq,
+  path = "3_OutputFigs",
+  width = 9.15,
+  height = 6,
+  dpi = 1200)
+```
+
+# Comparison of RNAseq data with qPCR data
+
+Here, we will compare gene expression changes as measured via RNAseq to the gene expression changes measured via RT-qPCR by making parallel graphs to those made for the RT-qPCR data. Those data are expressed as fold change to Medium 1, so we will calculate fold change to the mean of the expression in medium 1. This is raw fold change rather than log2 fold change, as the RT-qPCR results are presented as raw fold change. 
+
+```{r}
+# Filter data to genes of interest
+count_data_cleaned_forcomp <- count_data_cleaned %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% c("Krt5", "Foxj1", "Scgb1a1", "Mki67")) %>%
+  column_to_rownames("gene") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("sample")
+
+# Calculate mean expression and extract M1 (for reference meean for FCs)
+count_data_comp_means_M1 <- count_data_cleaned_forcomp %>%
+  tidyr::separate(sample, into = c("medium", "replicate")) %>%
+  group_by(medium) %>%
+  summarise(across(Mki67:Scgb1a1, \(x) mean(x))) %>%
+  filter(medium == "M1") %>%
+  column_to_rownames("medium") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("gene") %>%
+  rename("M1_Mean" = "M1")
+
+# Bind M1 means for each gene to dataframe and calculate fold changes
+count_data_comp_FC <- count_data_cleaned_forcomp %>%
+  column_to_rownames("sample") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("gene") %>%
+  left_join(count_data_comp_means_M1, by = "gene") %>%
+  mutate(across(M1.1:M3.3, \(x) x/M1_Mean)) %>%
+  select(-M1_Mean) %>%
+  column_to_rownames("gene") %>%
+  t() %>% data.frame() %>%
+  rownames_to_column("sample") %>%
+  separate(sample, into = c("medium", "replicate")) %>%
+  mutate(medium = gsub("M", "", medium)) 
+
+# Calculate means and standard deviations of fold changes for plotting and merge into one reference dataframe
+
+## Means
+count_data_comp_means <- count_data_comp_FC %>%
+  group_by(medium) %>%
+  summarise(across(Mki67:Scgb1a1, \(x) mean(x))) %>%
+  pivot_longer(!medium, names_to = "gene", values_to = "mean") %>%
+  unite(medium_gene, medium, gene, sep = "_")
+
+## Standard deviations
+count_data_comp_sds <- count_data_comp_FC %>%
+  group_by(medium) %>%
+  summarise(across(Mki67:Scgb1a1, \(x) sd(x))) %>%
+  pivot_longer(!medium, names_to = "gene", values_to = "sd") %>%
+  unite(medium_gene, medium, gene, sep = "_")
+
+## Merge
+count_data_comp_mean_sd <- left_join(count_data_comp_means, count_data_comp_sds, by = "medium_gene") %>%
+  separate(medium_gene, into = c("medium", "gene")) %>%
+  mutate(gene = factor(gene, levels = c("Krt5", "Foxj1", "Scgb1a1", "Mki67")))
+
+# Pivot FC data longer for plotting
+count_data_comp_FC_long <- count_data_comp_FC %>% pivot_longer(-c(medium, replicate), names_to = "gene", values_to = "FC") %>%
+  mutate(gene = factor(gene, levels = c("Krt5", "Foxj1", "Scgb1a1", "Mki67")))
+
+# Set seed so jitter stays the same across each time the plot is made
+set.seed(8016)
+
+# Plot
+gene_comparison_graph <- ggplot() +
+  geom_errorbar(data = count_data_comp_mean_sd, aes(x = medium, ymin = mean - sd, ymax = mean + sd), width = 0.2) + 
+  geom_jitter(data = count_data_comp_FC_long, aes (x = medium, y = FC),
+              position = position_jitter(0.15), size = 2) +
+  stat_summary(data = count_data_comp_FC_long, fun = "mean", geom = "segment", aes(
+      x = as.numeric(factor(medium)) - 0.5 / 2,
+      xend = as.numeric(factor(medium)) + 0.5 / 2,
+      y = FC,
+      yend = after_stat(y),
+      group = medium
+    ),
+    color = "black"
+  ) +
+  ylab("Fold Change (vs. Medium 1)") +
+  xlab("Expansion Medium") +
+  facet_wrap(~gene, nrow = 1, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult=c(0, 0.5)), limits = c(0, NA)) +
+  theme_prism() +
+  theme(strip.text = element_text(face = "bold.italic", size = 15),
+        panel.spacing = unit(2, "lines"))
+
+gene_comparison_graph
+
+pdf(file = "3_OutputFigs/qPCR_Comparison_Plot.pdf", 
+    width = 12, height = 4)
+gene_comparison_graph
+invisible(dev.off())
+```
+
+Pull DESeq results for each of the genes for manually annotation on graph:
+```{r}
+deseq_res_1vs2_qPCR <- deseq_res_1vs2 %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% c("Krt5", "Foxj1", "Scgb1a1", "Mki67"))
+
+deseq_res_1vs3_qPCR <- deseq_res_1vs3 %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% c("Krt5", "Foxj1", "Scgb1a1", "Mki67"))
+
+deseq_res_2vs3_qPCR <- deseq_res_2vs3 %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% c("Krt5", "Foxj1", "Scgb1a1", "Mki67"))
+```
+
+
