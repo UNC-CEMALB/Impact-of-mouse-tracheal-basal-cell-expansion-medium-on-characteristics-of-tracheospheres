@@ -4,7 +4,7 @@ This repository contains script associated with the unpublished manuscript "Impa
 
 Script authors: 
 - Matlab: Vitor Mori, PhD (Vitor.Mori@uvm.edu)
-- - R: Elise Hickman, PhD (ehickman@email.unc.edu)
+- R: Elise Hickman, PhD (ehickman@email.unc.edu)
 
 The script was developed to:
 
